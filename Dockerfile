@@ -46,7 +46,7 @@ RUN npm install --prefer-offline --no-audit && \
     npm cache clean --force
 
 RUN uv venv && \
-    uv pip install --no-cache-dir -e ".[all]"
+    uv pip install --no-cache-dir -e ".[all,messaging]"
 
 RUN chmod -R a+rX /opt/hermes
 

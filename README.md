@@ -44,7 +44,7 @@ Set these variables:
 | Variable | Value | Required | Description |
 | --- | --- | --- | --- |
 | `PORT` | `8080` | Yes | Public HTTP port. |
-| `ADMIN_PASSWORD` | `${{ secret(32) }}` | Yes | Password for Hermes WebUI. Materialized once at template deploy. |
+| `ADMIN_PASSWORD` | `${{ secret(32) }}` | Recommended | Password for Hermes WebUI (set explicitly in production). If unset, the entrypoint generates one, persists it to `/data/admin.password`, and prints it once to the deploy logs. |
 | `SEARXNG_URL` | `http://${{searxng-railway.RAILWAY_PRIVATE_DOMAIN}}:${{searxng-railway.PORT}}` | Recommended | Private URL for the companion SearXNG service. |
 | `START_GATEWAY` | `false` | Optional | Set to `true` to also run `hermes gateway run --replace` as a background daemon (messaging bridges). Configure channel tokens in WebUI Settings first, then redeploy with this flag. |
 
@@ -73,6 +73,15 @@ Messaging channel variables (used when `START_GATEWAY=true`):
 | `SLACK_APP_TOKEN` | Slack app token for socket mode. |
 | `SLACK_ALLOWED_USERS` | Comma-separated Slack user IDs. |
 
+### Telegram on Railway
+
+Hermes defaults to **long polling** against Telegram — no webhook URL needed; once `START_GATEWAY=true` and your bot credentials are configured, the gateway pulls updates outbound.
+
+Alternatively you can use **webhook** mode per upstream docs: set `TELEGRAM_WEBHOOK_URL` (public HTTPS endpoint Telegram can reach), `TELEGRAM_WEBHOOK_SECRET` (required when using webhooks; generate e.g. with `openssl rand -hex 32`), and optionally `TELEGRAM_WEBHOOK_PORT` for the **local** port the webhook server binds to (often not the same as Railway’s `$PORT`; your reverse proxy must route the public HTTPS path to that listener). Railway’s managed HTTPS terminates at your service `$PORT`; follow the Hermes webhook guidance so the externally advertised URL matches what Telegram posts to.
+
+- [Hermes: Telegram messaging](https://hermes-agent.nousresearch.com/docs/user-guide/messaging/telegram)
+- [Hermes: environment variables reference](https://hermes-agent.nousresearch.com/docs/reference/environment-variables)
+
 ### Service 2: SearXNG
 
 Use the existing Protemplate SearXNG source/template from [SearXNG on Railway](https://railway.com/deploy/searxng-w-official-i).
@@ -92,7 +101,7 @@ SearXNG can be private-only if Hermes is the only consumer. Keep public HTTP ena
 
 1. Deploy the two-service template.
 2. Open the Hermes Agent public Railway URL.
-3. Enter `ADMIN_PASSWORD` when prompted.
+3. Enter the WebUI password (your `ADMIN_PASSWORD` if set; otherwise retrieve it once from `/data/admin.password` or deploy logs — see deploy variables table).
 4. The WebUI's onboarding wizard launches — pick a provider, paste an API key, choose a default model. Configuration is written to `/data/.env` and `/data/config.yaml`.
 5. Send your first message in the chat.
 6. (Optional) To enable Telegram/Discord/Slack/email bridges, configure the channel tokens in **Settings**, then redeploy with `START_GATEWAY=true`.
@@ -160,7 +169,12 @@ Open `http://localhost:8080` and enter `changeme` at the password prompt.
 - **OAuth one-shots** (`/tui/ws/auth/<provider>`) — clicking an OAuth button spawns a dedicated PTY running `hermes auth add <provider> --type oauth --no-browser`. On clean exit, the wrapper writes `model.provider` into `/data/config.yaml`, marks onboarding complete, restarts hermes-webui, and the page redirects you to `/`.
 - **Shell** (`/tui/ws/shell`) — clicking "Open shell" or any non-OAuth preset spawns `/bin/bash -i` with `cwd=/data` and Hermes' venv on PATH. Run `hermes status`, `hermes auth list`, `cat /data/config.yaml`, `tail .../webui.log` — anything you'd run over SSH.
 
-Hermes' OAuth providers (ChatGPT/Codex and Nous Portal) use the **OAuth device-code grant (RFC 8628)**, which doesn't require a localhost callback — perfect for remote deployments. The OAuth flow:
+### `hermes update` from the Web Terminal
+
+Hermes installs live under `/opt/hermes`. Git 2.35+ refuses pulls when the checkout is owned by a different Unix user than the one running Git (the classic error: **"detected dubious ownership"**). Older template images cloned that tree as root but ran shells as user `hermes`, so `hermes update` failed. Current images **`chown` `/opt/hermes` and `/opt/hermes-webui` to `hermes`** and set **`safe.directory`** in the system Git config so in-container updates work reliably. Redeploy from this template to pick up the fix.
+
+The **`/tui` shortcut OAuth buttons** are only wired for ChatGPT (**Codex**) and **Nous Portal**. Other OAuth-capable providers are reached interactively (`hermes model`, `hermes auth add …`, etc.) via the **`/bin/bash` shell pane** — same device-code flow where applicable — not extra one-click presets. ChatGPT/Codex and Nous Portal use the **OAuth device-code grant (RFC 8628)**, which doesn't require a localhost callback — workable for remote deployments. The Codex/Nous shortcut flow:
+
 
 1. Visit `/tui` (you must already be logged in to the Hermes WebUI).
 2. Click **Login with ChatGPT (Codex)** or **Login with Nous Portal**.
@@ -173,7 +187,7 @@ API-key providers (OpenRouter, OpenAI, Anthropic, Google Gemini, etc.) use the i
 
 ## Notes
 
+- **Skills at boot:** Upstream Docker runs `tools/skills_sync.py` from the Hermes install tree to mirror bundled skills onto the volume. This template does **not** run that script; only bundles under [`hermes-agent-railway/skills/`](./skills/) are copied into `/data/skills` each start. Operators who expect **all** upstream stock skills mirrored should sync them manually or adjust the deployment.
 - Hermes Agent is installed from upstream `NousResearch/hermes-agent` (`ARG HERMES_REF=main`). Override with any valid branch, tag, or SHA.
 - Hermes WebUI is pinned to a specific tag (`ARG HERMES_WEBUI_REF=v0.50.278`). Override to upgrade.
 - `/data` stores config, `.env`, sessions, memories, skills, workspace files, logs, and WebUI state.
-- If `ADMIN_PASSWORD` is empty, the entrypoint generates one and persists it at `/data/admin.password`, also printing it once to the deploy logs.

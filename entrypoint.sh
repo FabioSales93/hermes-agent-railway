@@ -21,6 +21,7 @@ mkdir -p \
   "${HERMES_HOME}/cron" \
   "${HERMES_HOME}/home" \
   "${HERMES_HOME}/home/workspace" \
+  "${HERMES_HOME}/workspace" \
   "${HERMES_HOME}/hooks" \
   "${HERMES_HOME}/logs" \
   "${HERMES_HOME}/memories" \
