@@ -83,8 +83,12 @@ REGRAS:
 async def send_zapi_message(phone: str, message: str) -> dict:
     url = f"{ZAPI_BASE_URL}/send-text"
     payload = {"phone": phone, "message": message}
+    print(f"[ZAPI Send] Enviando para {phone}: {message[:80]}...")
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(url, headers=ZAPI_HEADERS, json=payload)
+    print(f"[ZAPI Send] Status: {r.status_code} | Response: {r.text[:200]}")
+    if r.status_code >= 400:
+        raise Exception(f"Z-API error {r.status_code}: {r.text}")
     return r.json()
 
 def extract_message_text(data: dict) -> str:
@@ -209,7 +213,11 @@ async def process_message(data: dict) -> dict:
     add_memory(phone, "assistant", bot_response)
     
     if bot_response:
-        await send_zapi_message(phone, bot_response)
+        try:
+            await send_zapi_message(phone, bot_response)
+            print(f"[Bot] Resposta enviada com sucesso para {phone}")
+        except Exception as e:
+            print(f"[Bot] ERRO ao enviar resposta para {phone}: {e}")
     
     return {"status": "processed", "phone": phone, "preview": bot_response[:80] + "..."}
 
