@@ -41,7 +41,8 @@ TEMPLATE_PATH = Path(__file__).parent / "templates" / "tui.html"
 
 
 # ============================================================
-# Z-API Webhook Handler (RaspadinhaShow) - BOT INTELIGENTE COM LLM
+# Z-API Webhook Handler (RaspadinhaShow) - BOT IA WHATSAPP
+# FIX v2: filtro ReceivedCallback + modelo OpenRouter grátis
 # ============================================================
 import os
 import httpx
@@ -49,172 +50,225 @@ import json
 from datetime import datetime
 from typing import Dict, List
 
-ZAPI_INSTANCE_ID = os.getenv("ZAPI_INSTANCE_ID")
+ZAPI_INSTANCE_ID    = os.getenv("ZAPI_INSTANCE_ID")
 ZAPI_INSTANCE_TOKEN = os.getenv("ZAPI_INSTANCE_TOKEN")
-ZAPI_CLIENT_TOKEN = os.getenv("ZAPI_CLIENT_TOKEN")
+ZAPI_CLIENT_TOKEN   = os.getenv("ZAPI_CLIENT_TOKEN")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
 
 ZAPI_BASE_URL = f"https://api.z-api.io/instances/{ZAPI_INSTANCE_ID}/token/{ZAPI_INSTANCE_TOKEN}"
-ZAPI_HEADERS = {"Client-Token": ZAPI_CLIENT_TOKEN, "Content-Type": "application/json"}
+ZAPI_HEADERS  = {"Client-Token": ZAPI_CLIENT_TOKEN, "Content-Type": "application/json"}
 
-# Memória de conversa (em produção: Redis/SQLite)
+# Memória de conversa em RAM (reseta no redeploy — ok para MVP)
 conversation_memory: Dict[str, List[Dict]] = {}
 
-# Deduplicação: messageIds já processados (evita loop de retry do Z-API)
+# Deduplicação de messageId para evitar loop de retry do Z-API
 processed_message_ids: set = set()
 MAX_PROCESSED_IDS = 10000
 
-SYSTEM_PROMPT = """Você é o assistente da RaspadinhaShow 🍓 — distribuidora de produtos para raspadinha/geladinho.
+SYSTEM_PROMPT = """Você é a assistente virtual da RaspadinhaShow 🍓.
 
-PERSONALIDADE: Amigável, direto, profissional. Respostas curtas (máx 3 frases). Uma pergunta por vez.
+A RaspadinhaShow é uma distribuidora de produtos para raspadinha e geladinho artesanal.
+Vendemos: copinhos, palitos, sacos para geladinho, xaropes, sabores, tampas, colheres e embalagens.
+Atendemos revendedores e pontos de venda em toda a região.
 
-OBJETIVO: Agendar visitas de reposição coletando:
-1. Quais produtos precisa
-2. Quando prefere visita (dias/horários)  
-3. Observações/restrições
+PERSONALIDADE: Simpática, objetiva e prestativa. Respostas curtas (máx 3 frases). Uma pergunta por vez.
 
-FLUXO: Converse naturalmente. Extraia info conforme surgem.
-Exemplo: "Copinhos e palitos semana que vem, dia 20 não tem ninguém" → "Entendido! Dia 20 não rola — dia 19 manhã ou dia 21 tarde?"
+OBJETIVO PRINCIPAL: Agendar visitas de reposição de estoque coletando:
+1. Quais produtos o cliente precisa
+2. Quando prefere receber a visita (dia e horário)
+3. Alguma observação ou restrição
+
+FLUXO NATURAL DE CONVERSA:
+- Cumprimente de volta quando o cliente cumprimentar
+- Pergunte se precisa de reposição
+- Quando confirmar que sim, pergunte quais produtos
+- Quando souber os produtos, pergunte o melhor dia/horário
+- Confirme o agendamento antes de encerrar
+
+EXEMPLO:
+Cliente: "Oi"
+Você: "Olá! Tudo bem? 🍓 Sou a assistente da RaspadinhaShow. Você precisa de reposição de produtos?"
+Cliente: "Sim, preciso de copinhos e palitos"
+Você: "Ótimo! Qual o melhor dia e horário pra nossa equipe te visitar?"
+Cliente: "Quarta de manhã"
+Você: "Perfeito! Confirmo visita na quarta de manhã com copinhos e palitos. Pode ser assim?"
+Cliente: "Pode"
+Você: "Confirmado! ✅ Nossa equipe estará aí na quarta de manhã. Qualquer dúvida é só chamar 🍓"
 
 REGRAS:
-- SEMPRE confirme antes de agendar: "Confirmo visita dia X às Yh, certo?"
+- SEMPRE confirme o agendamento antes de finalizar
 - Se não quer reposição: "Sem problemas! Qualquer coisa é só chamar 🍓"
-- Não invente datas/produtos — pergunte se não souber"""
+- Não invente informações — pergunte se não souber
+- Se a pergunta fugir do escopo, diga que só faz agendamentos e direcione para WhatsApp direto com a equipe"""
+
 
 async def send_zapi_message(phone: str, message: str) -> dict:
+    """Envia mensagem via Z-API"""
     url = f"{ZAPI_BASE_URL}/send-text"
     payload = {"phone": phone, "message": message}
+    print(f"[ZAPI Send] Enviando para {phone}: {message[:60]}...")
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(url, headers=ZAPI_HEADERS, json=payload)
+    print(f"[ZAPI Send] Status: {r.status_code} | Response: {r.text[:200]}")
     return r.json()
 
+
 def extract_message_text(data: dict) -> str:
-    msg_obj = data.get("message", {}) or {}
-    raw_text = msg_obj.get("text", "") or data.get("text", "") or ""
+    """
+    Extrai texto da mensagem nos diferentes formatos do Z-API:
+    - Formato antigo: {"message": {"text": "oi"}}
+    - Formato novo:   {"text": {"message": "oi"}}
+    - Formato simples:{"text": "oi"}
+    """
+    # Tenta "message.text" (formato antigo)
+    msg_obj = data.get("message") or {}
+    if isinstance(msg_obj, dict):
+        t = msg_obj.get("text", "")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+        if isinstance(t, dict):
+            return (t.get("message") or t.get("text") or "").strip()
+
+    # Tenta "text" no nível raiz (formato novo Z-API)
+    raw_text = data.get("text", "")
+    if isinstance(raw_text, str) and raw_text.strip():
+        return raw_text.strip()
     if isinstance(raw_text, dict):
-        return raw_text.get("text", "").strip()
-    return str(raw_text).strip()
+        return (raw_text.get("message") or raw_text.get("text") or "").strip()
+
+    return ""
+
 
 def get_memory(phone: str) -> List[Dict]:
     if phone not in conversation_memory:
         conversation_memory[phone] = []
     return conversation_memory[phone]
 
+
 def add_memory(phone: str, role: str, content: str):
     mem = get_memory(phone)
-    mem.append({"role": role, "content": content, "time": datetime.now().isoformat()})
+    mem.append({"role": role, "content": content})
     if len(mem) > 20:
         conversation_memory[phone] = mem[-20:]
 
+
 async def call_llm(messages: List[Dict]) -> str:
+    """Chama LLM via OpenRouter (modelo grátis)"""
+    if not OPENROUTER_API_KEY:
+        print("[Bot] OPENROUTER_API_KEY não configurada — usando fallback")
+        return intelligent_fallback(messages)
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.post(
-                "https://inference-api.nousresearch.com/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
                 json={
-                    "model": "Hermes-3-Llama-3.1-70B-FP8",
+                    "model": "nvidia/llama-3.1-nemotron-70b-instruct:free",
                     "messages": messages,
                     "temperature": 0.7,
                     "max_tokens": 300
                 },
-                headers={"Content-Type": "application/json"}
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://raspadinhashow.com.br",
+                    "X-Title": "RaspadinhaShow Bot"
+                }
             )
+            print(f"[Bot] LLM status: {r.status_code}")
             if r.status_code == 200:
-                return r.json()["choices"][0]["message"]["content"].strip()
+                resposta = r.json()["choices"][0]["message"]["content"].strip()
+                print(f"[Bot] LLM respondeu: {resposta[:80]}...")
+                return resposta
+            else:
+                print(f"[Bot] LLM erro: {r.text[:200]}")
     except Exception as e:
-        print(f"[Bot] LLM falhou: {e}")
+        print(f"[Bot] LLM exceção: {e}")
+
     return intelligent_fallback(messages)
 
+
 def intelligent_fallback(messages: List[Dict]) -> str:
-    user_msgs = [m["content"].lower() for m in messages if m["role"] == "user"]
-    last_msg = user_msgs[-1] if user_msgs else ""
-    all_text = " ".join(user_msgs)
-    
-    is_greeting = any(p in last_msg for p in ["oi", "olá", "bom dia", "boa tarde", "boa noite", "ola"])
-    said_no = any(p in last_msg for p in ["não preciso", "nao preciso", "não quero", "nao quero", "sem reposição", "não vou", "nao vou"])
-    has_products = any(p in all_text for p in ["copinho", "palito", "saco", "xarope", "sabor", "copo", "colher", "tampa", "produto"])
-    has_specific_date = any(p in last_msg for p in ["dia ", "amanhã", "hoje", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo", "manhã", "tarde", "noite"])
-    has_generic_time = any(p in all_text for p in ["semana", "próxim", "proxim", "vindo"])
-    confirmation = any(p in last_msg for p in ["confirmo", "confirmado", "pode confirmar", "tá bom", "ta bom", "certo", "ok", "beleza", "sim", "pode ser"])
-    wants_reschedule = any(p in last_msg for p in ["reagendar", "mudar", "outro dia", "outra data", "não dá", "nao da"])
-    
-    if said_no and not has_products:
+    """Fallback sem LLM — fluxo baseado em palavras-chave"""
+    user_msgs = [m["content"].lower() for m in messages if m.get("role") == "user"]
+    last_msg  = user_msgs[-1] if user_msgs else ""
+    all_text  = " ".join(user_msgs)
+
+    produtos_lista = ["copinho", "palito", "saco", "xarope", "sabor", "copo", "colher", "tampa", "embalagem"]
+
+    is_greeting    = any(p in last_msg for p in ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hello", "ei"])
+    said_no        = any(p in last_msg for p in ["não preciso", "nao preciso", "não quero", "nao quero", "sem reposição", "nao vou", "não vou"])
+    has_products   = any(p in all_text for p in produtos_lista)
+    has_date       = any(p in last_msg for p in ["dia ", "amanhã", "hoje", "segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo", "manhã", "tarde", "noite"])
+    confirmation   = any(p in last_msg for p in ["sim", "s", "ok", "pode", "certo", "beleza", "confirmo", "tá bom", "ta bom"])
+    wants_products = any(p in last_msg for p in ["sim", "s", "quero", "preciso", "1"]) and not has_products
+
+    if said_no:
         return "Sem problemas! Qualquer coisa é só chamar 🍓"
-    
-    if (is_greeting or len(user_msgs) == 1) and not has_products:
-        return ("Olá! Tudo bem? 🍓 Essa é a mensagem automática de agendamento. "
-                "Você precisa de reposição de produtos esta semana?\n\n"
-                "Responda:\n1️⃣ SIM - Preciso de reposição\n2️⃣ NÃO - Não preciso esta semana")
-    
-    if has_products and not has_specific_date:
-        produtos = [p for p in ["copinho", "palito", "saco", "xarope", "sabor", "copo", "colher", "tampa"] if p in all_text]
-        prod_txt = ", ".join(produtos) if produtos else "os produtos"
-        return (f"Anotado: {prod_txt} ✅\n\n"
-                f"Quando prefere a visita? Me avisa dia/horário que fica melhor "
-                f"(ex: \"quarta de manhã\" ou \"dia 20 à tarde\").")
-    
-    if has_products and has_specific_date and not confirmation:
-        return ("Entendido! Anotei a preferência de data.\n\n"
-                "Confirmo a visita combinada — certo?\n\n"
-                "Responda:\n1️⃣ SIM - Confirmo a visita\n2️⃣ NÃO - Preciso ajustar")
-    
-    if confirmation and has_products and has_specific_date:
-        return ("✅ Visita confirmada! 🍓\n\n"
-                "Nossa equipe vai te visitar no dia combinado. Se houver imprevisto, avisa a gente.\n\n"
-                "Obrigado! 🍓 *RaspadinhaShow*")
-    
-    if wants_reschedule and has_products:
-        return ("📅 Sem problemas!\n\nMe avisa qual dia/horário fica melhor pra você. "
-                "A gente ajusta e confirma.")
-    
-    if last_msg in ["sim", "s", "1", "quero", "preciso"] and not has_products:
-        return ("Beleza! Quais produtos você precisa? "
-                "(ex: copinhos, palitos, sacos, xaropes, sabores...)")
-    
-    return ("Não entendi completamente. Me explica melhor: "
-            "quais produtos precisa e quando prefere a visita?")
+
+    if is_greeting and len(user_msgs) == 1:
+        return "Olá! Tudo bem? 🍓 Sou a assistente da RaspadinhaShow. Você precisa de reposição de produtos?"
+
+    if wants_products:
+        return "Ótimo! Quais produtos você precisa? (copinhos, palitos, sacos, xaropes, sabores...)"
+
+    if has_products and not has_date:
+        prods = [p for p in produtos_lista if p in all_text]
+        return f"Anotado: {', '.join(prods)} ✅\n\nQual o melhor dia e horário pra nossa equipe te visitar?"
+
+    if has_products and has_date and not confirmation:
+        return "Perfeito! Confirmo a visita no horário combinado com os produtos. Pode ser assim? ✅"
+
+    if confirmation and has_products:
+        return "Confirmado! ✅ Nossa equipe estará aí no horário combinado. Qualquer dúvida é só chamar 🍓"
+
+    return "Não entendi completamente 😅 Me conta: quais produtos precisa e qual o melhor dia/horário pra visita?"
+
 
 async def process_message(data: dict) -> dict:
-    phone = data.get("phone") or data.get("from") or data.get("sender", {}).get("phone")
+    """Processa mensagem recebida e envia resposta"""
+    phone        = data.get("phone") or data.get("from", "")
     message_text = extract_message_text(data)
-    message_id = data.get("messageId") or data.get("id") or data.get("message", {}).get("id")
-    event_type = data.get("type") or data.get("event")
-    
-    # Ignora status updates (delivered, read, etc.) - não têm texto de mensagem
-    if event_type in ["status", "ack", "delivery", "read", "received"] and not message_text:
-        return {"status": "ignored", "reason": f"status event: {event_type}"}
-    
+    message_id   = data.get("messageId") or data.get("id", "")
+    from_me      = data.get("fromMe", False)
+
+    print(f"[Bot] phone={phone} | fromMe={from_me} | texto='{message_text}' | msgId={message_id}")
+
+    # Ignora mensagens enviadas pelo próprio bot
+    if from_me:
+        return {"status": "ignored", "reason": "fromMe=true"}
+
     # Ignora se não tem telefone ou mensagem
     if not phone or not message_text:
-        return {"status": "ignored", "reason": "missing phone or message"}
-    
+        return {"status": "ignored", "reason": "sem phone ou texto"}
+
     # Deduplicação por messageId
     if message_id:
         if message_id in processed_message_ids:
-            return {"status": "ignored", "reason": f"duplicate messageId: {message_id}"}
+            return {"status": "ignored", "reason": f"duplicado: {message_id}"}
         processed_message_ids.add(message_id)
-        # Limita tamanho do set
         if len(processed_message_ids) > MAX_PROCESSED_IDS:
-            # Remove metade dos mais antigos (simples)
             to_remove = list(processed_message_ids)[:MAX_PROCESSED_IDS // 2]
             for mid in to_remove:
                 processed_message_ids.discard(mid)
-    
+
+    # Adiciona mensagem do usuário à memória
     add_memory(phone, "user", message_text)
-    
+
+    # Monta contexto para o LLM
     memory = get_memory(phone)
     llm_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    llm_messages.extend(memory[-10:])
-    
+    llm_messages.extend({"role": m["role"], "content": m["content"]} for m in memory[-10:])
+
+    # Chama LLM
     bot_response = await call_llm(llm_messages)
     add_memory(phone, "assistant", bot_response)
-    
+
+    # Envia resposta via Z-API
     if bot_response:
         await send_zapi_message(phone, bot_response)
-    
-    return {"status": "processed", "phone": phone, "preview": bot_response[:80] + "..."}
 
-async def raspadinha_webhook_handler(data: dict) -> dict:
-    return await process_message(data)
+    return {"status": "processed", "phone": phone, "preview": bot_response[:80]}
 
 
 async def zapi_webhook(request: Request):
@@ -222,17 +276,28 @@ async def zapi_webhook(request: Request):
     try:
         data = await request.json()
         print(f"[ZAPI Webhook] RAW PAYLOAD: {json.dumps(data, ensure_ascii=False, indent=2)}")
-        print(f"[ZAPI Webhook] Headers: {dict(request.headers)}")
-        
-        event_type = data.get("type") or data.get("event")
-        
-        # Z-API manda "ReceivedCallback" para mensagens recebidas
-        if event_type in ["message", "receive", "text", "incoming", "ReceivedCallback"] or "message" in data:
-            result = await raspadinha_webhook_handler(data)
+
+        event_type = data.get("type") or data.get("event", "")
+
+        # FIX: inclui ReceivedCallback (formato real do Z-API)
+        # e também mantém formatos alternativos para compatibilidade
+        should_process = (
+            event_type == "ReceivedCallback"
+            or event_type in ["message", "receive", "text", "incoming"]
+            or ("message" in data and event_type not in [
+                "DeliveryCallback", "MessageStatusCallback",
+                "PresenceChatCallback", "ConnectedCallback",
+                "DisconnectedCallback", "AllChatsCallback"
+            ])
+        )
+
+        if should_process:
+            result = await process_message(data)
             return JSONResponse({"received": True, "result": result})
-        
+
+        # Outros eventos (delivery, status, presence) — só confirma recebimento
         return JSONResponse({"received": True, "event": event_type})
-        
+
     except Exception as e:
         print(f"[ZAPI Webhook] Erro: {e}")
         return JSONResponse({"received": False, "error": str(e)}, status_code=500)
@@ -242,19 +307,14 @@ async def zapi_webhook_health(request: Request):
     """Health check do webhook"""
     return JSONResponse({
         "status": "ok",
-        "service": "raspadinhashow-webhook",
-        "instance": ZAPI_INSTANCE_ID
+        "service": "raspadinhashow-whatsapp-bot",
+        "instance": ZAPI_INSTANCE_ID,
+        "llm": "openrouter" if OPENROUTER_API_KEY else "fallback"
     })
 
 
 async def _is_authenticated(request: Request) -> bool:
-    """Cheap auth probe: hit hermes-webui's /api/onboarding/status with the user's cookies.
-
-    First call after boot can be slow (5+s) due to hermes_cli imports inside the
-    webui server. Use a generous timeout — auth checks are infrequent.
-    """
     import httpx
-
     cookie = request.headers.get("cookie", "")
     if not cookie:
         return False
@@ -283,12 +343,10 @@ routes = [
     # Z-API Webhook endpoints (RaspadinhaShow)
     Route("/webhook/zapi", zapi_webhook, methods=["POST"]),
     Route("/webhook/zapi/health", zapi_webhook_health, methods=["GET"]),
-    # Catch-all proxy for everything else (HTTP + WebSocket).
+    # Catch-all proxy
     WebSocketRoute("/{path:path}", hermes_proxy.ws_proxy),
     Route("/{path:path}", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
-    # Root path needs its own route — Starlette's path converter requires at least one segment.
     Route("/", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
 ]
-
 
 app = Starlette(debug=False, routes=routes)
