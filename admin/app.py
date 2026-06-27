@@ -334,7 +334,82 @@ async def tui_page(request: Request):
         return RedirectResponse("/login?next=/tui", status_code=303)
     return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
 
+# ============================================================
+# Meta WhatsApp Cloud API Webhook (RaspadinhaShow) — OFICIAL
+# Reusa memória + LLM + persona; recebe e envia pela Meta.
+# ============================================================
+from starlette.responses import PlainTextResponse
 
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+WHATSAPP_ACCESS_TOKEN    = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+WHATSAPP_VERIFY_TOKEN    = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+WHATSAPP_GRAPH_VERSION   = os.getenv("WHATSAPP_GRAPH_VERSION", "v21.0")
+
+
+async def send_meta_message(phone: str, message: str) -> dict:
+    """Envia mensagem pela Meta WhatsApp Cloud API (oficial)."""
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": phone, "type": "text", "text": {"body": message}}
+    print(f"[Meta Send] -> {phone}: {message[:60]}...")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, headers=headers, json=payload)
+    print(f"[Meta Send] Status: {r.status_code} | {r.text[:200]}")
+    try:
+        return r.json()
+    except Exception:
+        return {"status_code": r.status_code, "text": r.text}
+
+
+async def process_message_meta(phone: str, message_text: str, message_id: str) -> dict:
+    """Mesma lógica do bot (memória + LLM + persona), respondendo pela Meta."""
+    if not phone or not message_text:
+        return {"status": "ignored", "reason": "sem phone ou texto"}
+    if message_id:
+        if message_id in processed_message_ids:
+            return {"status": "ignored", "reason": f"duplicado: {message_id}"}
+        processed_message_ids.add(message_id)
+        if len(processed_message_ids) > MAX_PROCESSED_IDS:
+            for mid in list(processed_message_ids)[:MAX_PROCESSED_IDS // 2]:
+                processed_message_ids.discard(mid)
+    add_memory(phone, "user", message_text)
+    memory = get_memory(phone)
+    llm_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    llm_messages.extend({"role": m["role"], "content": m["content"]} for m in memory[-10:])
+    bot_response = await call_llm(llm_messages)
+    add_memory(phone, "assistant", bot_response)
+    if bot_response:
+        await send_meta_message(phone, bot_response)
+    return {"status": "processed", "phone": phone, "preview": bot_response[:80]}
+
+
+async def meta_webhook(request: Request):
+    """GET = handshake de verificação da Meta. POST = mensagens recebidas."""
+    if request.method == "GET":
+        p = request.query_params
+        if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN:
+            print("[Meta Webhook] Verificacao OK")
+            return PlainTextResponse(p.get("hub.challenge", ""))
+        print("[Meta Webhook] Verificacao FALHOU")
+        return PlainTextResponse("forbidden", status_code=403)
+    try:
+        data = await request.json()
+        print(f"[Meta Webhook] RAW: {json.dumps(data, ensure_ascii=False)[:1000]}")
+        results = []
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                for msg in value.get("messages", []):
+                    if msg.get("type") != "text":
+                        continue  # por enquanto só texto
+                    phone = msg.get("from", "")
+                    message_text = (msg.get("text") or {}).get("body", "").strip()
+                    message_id = msg.get("id", "")
+                    results.append(await process_message_meta(phone, message_text, message_id))
+        return JSONResponse({"received": True, "results": results})
+    except Exception as e:
+        print(f"[Meta Webhook] Erro: {e}")
+        return JSONResponse({"received": True, "error": str(e)})  # 200 sempre, evita reenvio em loop
 routes = [
     Route("/tui", tui_page, methods=["GET"]),
     WebSocketRoute("/tui/ws/auth/{provider}", hermes_terminal.login_ws),
@@ -343,6 +418,8 @@ routes = [
     # Z-API Webhook endpoints (RaspadinhaShow)
     Route("/webhook/zapi", zapi_webhook, methods=["POST"]),
     Route("/webhook/zapi/health", zapi_webhook_health, methods=["GET"]),
+      # Meta WhatsApp Cloud API (oficial)
+    Route("/webhook/meta", meta_webhook, methods=["GET", "POST"]),
     # Catch-all proxy
     WebSocketRoute("/{path:path}", hermes_proxy.ws_proxy),
     Route("/{path:path}", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
