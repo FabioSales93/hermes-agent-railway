@@ -161,7 +161,7 @@ async def call_llm(messages: List[Dict]) -> str:
             r = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 json={
-                    "model": "nvidia/llama-3.1-nemotron-70b-instruct:free",
+                    "model": "deepseek/deepseek-v4-flash",
                     "messages": messages,
                     "temperature": 0.7,
                     "max_tokens": 300
