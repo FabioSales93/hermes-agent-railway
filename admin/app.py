@@ -426,3 +426,4 @@ routes = [
 
 app = Starlette(debug=False, routes=routes)
 # redeploy: forçar deploy do modelo deepseek
+# redeploy 2 (auto-deploy religado)
