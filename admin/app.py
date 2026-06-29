@@ -28,6 +28,8 @@ TEMPLATE_PATH = Path(__file__).parent / "templates" / "tui.html"
 # RaspadinhaShow — Bot WhatsApp (Z-API legado + Meta oficial)
 # ============================================================
 import os
+import re
+import html
 import httpx
 import json
 from datetime import datetime
@@ -52,10 +54,20 @@ MAX_PROCESSED_IDS = 10000
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_ACCESS_TOKEN    = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_VERIFY_TOKEN    = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
-WHATSAPP_GRAPH_VERSION   = os.getenv("WHATSAPP_GRAPH_VERSION", "v21.0")
+WHATSAPP_GRAPH_VERSION   = os.getenv("WHATSAPP_GRAPH_VERSION", "v22.0")
+
+# Groq (transcrição de áudio via Whisper)
+GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
+GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
+
+# Telegram (bot central: alertas pro Fábio + ele responde por lá)
+TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
 # Ponte de dados: cada interação é gravada aqui pro Hermes ler
-LEADS_PATH = "/data/raspadinha/leads.jsonl"
+LEADS_PATH  = "/data/raspadinha/leads.jsonl"
+STATUS_PATH = "/data/raspadinha/status.jsonl"
 
 SYSTEM_PROMPT = """Você é o atendimento da RaspadinhaShow no WhatsApp. Fale como uma PESSOA da equipe — natural, simpática e informal. O dono é o Fábio.
 
@@ -83,8 +95,19 @@ NÃO pergunte itens, sabores, quantidade nem dia/horário (a rota já é fixa).
 Quando tiver as 4 informações, finalize com:
 "Olá [Nome], anotei aqui: [Estabelecimento] em [Cidade]. Vou confirmar o dia certinho que passamos por aí e já te retorno, tá?"
 
+# CONFIRMAÇÃO DE VISITA (cliente que já é atendido)
+Às vezes o cliente já é da casa e só responde confirmando dia de visita (ex: "pode quinta", "passa quarta", "pode vir"). Nesse caso NÃO peça estabelecimento/cidade de novo. Apenas confirme de forma simpática: "Show! Anotei aqui pra passar [dia]. Qualquer coisa te aviso, tá?". Chame pelo nome só se ele já tiver dito o nome.
+
 # DÚVIDAS QUE VOCÊ RESPONDE
 Mecânica do sorteio, arremate, comissão (25% + brinde) e prazo (30 a 45 dias). Explique de forma simples.
+
+# QUANDO CHAMAR O FÁBIO (escalonamento)
+Se acontecer qualquer uma destas situações, comece sua resposta com a marca [ESCALAR] seguida de uma frase curta e natural pro cliente (ex: "[ESCALAR] Deixa eu confirmar uma coisa aqui com a equipe e já te retorno, tá?"):
+- O cliente pedir pra falar com uma pessoa ou com o Fábio.
+- Uma reclamação, problema ou algo que você não consegue resolver.
+- Você não entender o que o cliente quer depois de tentar.
+- Qualquer assunto sério ou fora do comum.
+A marca [ESCALAR] é só um sinal interno no comecinho da mensagem — nunca explique ela pro cliente.
 
 # FORA DO ESCOPO
 Se o cliente puxar assunto que não é da RaspadinhaShow (política, futebol, cotações, vida pessoal, etc.), responda:
@@ -106,6 +129,34 @@ def registrar_lead(phone: str, name: str, text: str, reply: str) -> None:
             }, ensure_ascii=False) + "\n")
     except Exception as e:
         print(f"[Lead] erro ao gravar: {e}")
+
+
+def registrar_status(destino: str, estado: str, raw: dict) -> None:
+    """Salva o status de entrega (sent/delivered/read/failed) pro Hermes ler."""
+    try:
+        os.makedirs(os.path.dirname(STATUS_PATH), exist_ok=True)
+        with open(STATUS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "destino": destino,
+                "estado": estado,
+                "errors": raw.get("errors", []),
+            }, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[Status] erro ao gravar: {e}")
+
+
+def ja_processado(message_id: str) -> bool:
+    """Dedup de messageId pra não responder duas vezes no retry da Meta."""
+    if not message_id:
+        return False
+    if message_id in processed_message_ids:
+        return True
+    processed_message_ids.add(message_id)
+    if len(processed_message_ids) > MAX_PROCESSED_IDS:
+        for mid in list(processed_message_ids)[:MAX_PROCESSED_IDS // 2]:
+            processed_message_ids.discard(mid)
+    return False
 
 
 def get_memory(phone: str) -> List[Dict]:
@@ -163,6 +214,93 @@ async def call_llm(messages: List[Dict]) -> str:
     return intelligent_fallback(messages)
 
 
+# ----------------------------------------------------------------
+# Mídia (áudio/imagem) e transcrição
+# ----------------------------------------------------------------
+async def baixar_midia_meta(media_id: str) -> bytes | None:
+    """Baixa o binário de uma mídia (áudio, imagem) da Meta."""
+    if not media_id:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            meta = await client.get(
+                f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{media_id}",
+                headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"},
+            )
+            if meta.status_code != 200:
+                print(f"[Midia] erro metadados: {meta.status_code} {meta.text[:200]}")
+                return None
+            media_url = meta.json().get("url")
+            if not media_url:
+                return None
+            bin_r = await client.get(media_url, headers={"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"})
+            if bin_r.status_code != 200:
+                print(f"[Midia] erro download: {bin_r.status_code}")
+                return None
+            return bin_r.content
+    except Exception as e:
+        print(f"[Midia] exceção: {e}")
+        return None
+
+
+async def transcrever_audio(audio_bytes: bytes) -> str:
+    """Transcreve áudio via Groq Whisper. Retorna '' se não der."""
+    if not GROQ_API_KEY or not audio_bytes:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                files={"file": ("audio.ogg", audio_bytes, "audio/ogg")},
+                data={"model": GROQ_WHISPER_MODEL, "language": "pt"},
+            )
+        if r.status_code == 200:
+            txt = (r.json().get("text") or "").strip()
+            print(f"[Groq] transcrição: {txt[:80]}")
+            return txt
+        print(f"[Groq] erro {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[Groq] exceção: {e}")
+    return ""
+
+
+# ----------------------------------------------------------------
+# Telegram (alertas + escalonamento)
+# ----------------------------------------------------------------
+async def enviar_telegram(texto: str) -> None:
+    """Manda mensagem pro Fábio no bot central do Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[Telegram] não configurado — alerta perdido: {texto[:80]}")
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "HTML"},
+            )
+        if r.status_code != 200:
+            print(f"[Telegram] erro {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[Telegram] exceção: {e}")
+
+
+async def escalar(phone: str, name: str, motivo: str, conteudo: str) -> None:
+    """Avisa o Fábio no Telegram que um cliente precisa dele."""
+    quem = html.escape(name or phone)
+    await enviar_telegram(
+        f"🆘 <b>Atenção, Fábio</b>\n"
+        f"👤 {quem}\n"
+        f"💬 {html.escape(conteudo)}\n"
+        f"⚠️ {html.escape(motivo)}\n\n"
+        f"↩️ <i>Responda A ESTA mensagem pra falar direto com o cliente.</i>\n"
+        f"#id:{phone}"
+    )
+
+
+# ----------------------------------------------------------------
+# Envio Meta + processamento de texto
+# ----------------------------------------------------------------
 async def send_meta_message(phone: str, message: str) -> dict:
     """Envia mensagem pela Meta WhatsApp Cloud API (oficial)."""
     url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
@@ -178,31 +316,37 @@ async def send_meta_message(phone: str, message: str) -> dict:
         return {"status_code": r.status_code, "text": r.text}
 
 
-async def process_message_meta(phone: str, message_text: str, message_id: str, name: str = "") -> dict:
+async def process_message_meta(phone: str, message_text: str, name: str = "") -> dict:
     """Memória + LLM + persona, responde pela Meta e grava o lead em /data."""
     if not phone or not message_text:
         return {"status": "ignored", "reason": "sem phone ou texto"}
-    if message_id:
-        if message_id in processed_message_ids:
-            return {"status": "ignored", "reason": f"duplicado: {message_id}"}
-        processed_message_ids.add(message_id)
-        if len(processed_message_ids) > MAX_PROCESSED_IDS:
-            for mid in list(processed_message_ids)[:MAX_PROCESSED_IDS // 2]:
-                processed_message_ids.discard(mid)
+
     add_memory(phone, "user", message_text)
     memory = get_memory(phone)
     llm_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     llm_messages.extend({"role": m["role"], "content": m["content"]} for m in memory[-10:])
     bot_response = await call_llm(llm_messages)
+
+    # Escalonamento: o LLM pediu pra chamar o Fábio
+    escalar_flag = False
+    if bot_response.startswith("[ESCALAR]"):
+        escalar_flag = True
+        bot_response = bot_response.replace("[ESCALAR]", "", 1).strip()
+        if not bot_response:
+            bot_response = "Deixa eu confirmar uma coisa aqui com a equipe e já te retorno, tá? 😊"
+
     add_memory(phone, "assistant", bot_response)
     if bot_response:
         await send_meta_message(phone, bot_response)
+    if escalar_flag:
+        await escalar(phone, name, "o bot achou melhor te chamar", f'Cliente disse: "{message_text}"')
+
     registrar_lead(phone, name, message_text, bot_response)
     return {"status": "processed", "phone": phone, "preview": bot_response[:80]}
 
 
 async def meta_webhook(request: Request):
-    """GET = handshake de verificação da Meta. POST = mensagens recebidas."""
+    """GET = handshake de verificação da Meta. POST = mensagens + status."""
     if request.method == "GET":
         p = request.query_params
         if p.get("hub.mode") == "subscribe" and p.get("hub.verify_token") == WHATSAPP_VERIFY_TOKEN:
@@ -217,20 +361,115 @@ async def meta_webhook(request: Request):
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
+
+                # 1) Status de entrega (sent / delivered / read / failed)
+                for st in value.get("statuses", []):
+                    estado = st.get("status", "")
+                    destino = st.get("recipient_id", "")
+                    print(f"[Meta Status] {estado} -> {destino} (id={st.get('id', '')})")
+                    registrar_status(destino, estado, st)
+                    if estado == "failed":
+                        erros = st.get("errors", [])
+                        detalhe = "; ".join(
+                            f"{e.get('code')}: {e.get('title')} — {(e.get('error_data') or {}).get('details', '')}"
+                            for e in erros
+                        ) or "sem detalhe"
+                        print(f"[Meta Status] FALHOU -> {destino}: {detalhe}")
+                        await enviar_telegram(
+                            f"❌ <b>Mensagem NÃO entregue</b>\n"
+                            f"📱 {html.escape(destino)}\n"
+                            f"⚠️ {html.escape(detalhe)}"
+                        )
+
+                # 2) Mensagens recebidas
                 nomes = {c.get("wa_id", ""): (c.get("profile") or {}).get("name", "")
                          for c in value.get("contacts", [])}
                 for msg in value.get("messages", []):
-                    if msg.get("type") != "text":
-                        continue  # por enquanto só texto
                     phone = msg.get("from", "")
-                    message_text = (msg.get("text") or {}).get("body", "").strip()
                     message_id = msg.get("id", "")
                     name = nomes.get(phone, "")
-                    results.append(await process_message_meta(phone, message_text, message_id, name))
+                    mtype = msg.get("type", "")
+
+                    if ja_processado(message_id):
+                        continue
+
+                    if mtype == "text":
+                        message_text = (msg.get("text") or {}).get("body", "").strip()
+                        results.append(await process_message_meta(phone, message_text, name))
+
+                    elif mtype == "audio":
+                        media_id = (msg.get("audio") or {}).get("id", "")
+                        audio_bytes = await baixar_midia_meta(media_id)
+                        transcricao = await transcrever_audio(audio_bytes) if audio_bytes else ""
+                        if transcricao:
+                            results.append(await process_message_meta(phone, transcricao, name))
+                        else:
+                            await send_meta_message(phone, "Opa, recebi seu áudio! Deixa eu ouvir aqui e já te respondo, tá? 😊")
+                            await escalar(phone, name, "chegou um ÁUDIO que não consegui ouvir", "(áudio do cliente)")
+                            results.append({"status": "escalated", "reason": "audio"})
+
+                    elif mtype in ("image", "document", "video"):
+                        await send_meta_message(phone, "Opa, recebi aqui! Deixa eu dar uma olhada e já te falo, tá? 😊")
+                        await escalar(phone, name, f"chegou {mtype.upper()} (precisa da sua olhada)", f"({mtype} do cliente)")
+                        results.append({"status": "escalated", "reason": mtype})
+
+                    elif mtype == "sticker":
+                        continue  # figurinha = ignora (decisão do Fábio)
+
+                    else:
+                        continue
+
         return JSONResponse({"received": True, "results": results})
     except Exception as e:
         print(f"[Meta Webhook] Erro: {e}")
         return JSONResponse({"received": True, "error": str(e)})  # 200 sempre, evita reenvio em loop
+
+
+async def telegram_webhook(request: Request):
+    """Fábio responde no Telegram -> entrega no WhatsApp do cliente."""
+    if TELEGRAM_WEBHOOK_SECRET:
+        if request.headers.get("x-telegram-bot-api-secret-token") != TELEGRAM_WEBHOOK_SECRET:
+            return JSONResponse({"ok": False}, status_code=403)
+    try:
+        update = await request.json()
+        msg = update.get("message") or update.get("edited_message") or {}
+        chat_id = str((msg.get("chat") or {}).get("id", ""))
+        texto = (msg.get("text") or "").strip()
+
+        # só aceita do Fábio
+        if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+            return JSONResponse({"ok": True})
+        if not texto:
+            return JSONResponse({"ok": True})
+
+        # descobre o telefone do cliente
+        phone = ""
+        reply_text = (msg.get("reply_to_message") or {}).get("text") or ""
+        m = re.search(r"#id:(\d{8,15})", reply_text)
+        if m:
+            phone = m.group(1)
+        else:
+            cmd = re.match(r"^/r\s+(\d{8,15})\s+(.+)", texto, re.S)
+            if cmd:
+                phone = cmd.group(1)
+                texto = cmd.group(2).strip()
+
+        if not phone:
+            await enviar_telegram(
+                "⚠️ Não consegui identificar o cliente.\n"
+                "Responda <b>a uma mensagem de alerta</b>, ou use:\n"
+                "<code>/r 5511999999999 sua mensagem</code>"
+            )
+            return JSONResponse({"ok": True})
+
+        await send_meta_message(phone, texto)
+        add_memory(phone, "assistant", texto)
+        registrar_lead(phone, "(via Fábio/Telegram)", "[resposta manual]", texto)
+        await enviar_telegram(f"✅ Enviado pro cliente {html.escape(phone)}.")
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print(f"[Telegram Webhook] erro: {e}")
+        return JSONResponse({"ok": True})
 
 
 async def meta_webhook_health(request: Request):
@@ -240,6 +479,8 @@ async def meta_webhook_health(request: Request):
         "service": "raspadinhashow-meta",
         "phone_number_id": WHATSAPP_PHONE_NUMBER_ID,
         "llm": "openrouter" if OPENROUTER_API_KEY else "fallback",
+        "audio": "groq" if GROQ_API_KEY else "off",
+        "telegram": "on" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "off",
     })
 
 
@@ -273,6 +514,8 @@ routes = [
     # Meta WhatsApp Cloud API (oficial)
     Route("/webhook/meta", meta_webhook, methods=["GET", "POST"]),
     Route("/webhook/meta/health", meta_webhook_health, methods=["GET"]),
+    # Telegram (Fábio responde por lá)
+    Route("/webhook/telegram", telegram_webhook, methods=["POST"]),
     # Catch-all proxy para o resto (HTTP + WebSocket)
     WebSocketRoute("/{path:path}", hermes_proxy.ws_proxy),
     Route("/{path:path}", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
