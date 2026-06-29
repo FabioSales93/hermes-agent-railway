@@ -60,10 +60,10 @@ WHATSAPP_GRAPH_VERSION   = os.getenv("WHATSAPP_GRAPH_VERSION", "v22.0")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
 GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
 
-# Telegram (bot central: alertas pro Fábio + ele responde por lá)
-TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID", "")
-TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+# Telegram (bot RaspadinhaShow — nomes próprios pra NÃO conflitar com o bot do Hermes)
+TELEGRAM_BOT_TOKEN      = os.getenv("RASPA_TG_TOKEN", "")
+TELEGRAM_CHAT_ID        = os.getenv("RASPA_TG_CHAT_ID", "")
+TELEGRAM_WEBHOOK_SECRET = os.getenv("RASPA_TG_SECRET", "")
 
 # Ponte de dados: cada interação é gravada aqui pro Hermes ler
 LEADS_PATH  = "/data/raspadinha/leads.jsonl"
