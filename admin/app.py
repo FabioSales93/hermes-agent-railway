@@ -172,6 +172,21 @@ def add_memory(phone: str, role: str, content: str):
         conversation_memory[phone] = mem[-20:]
 
 
+def historico_recente(phone: str, n: int = 3) -> str:
+    """Monta um resumo das últimas N mensagens pra dar contexto nos alertas."""
+    mem = conversation_memory.get(phone, [])
+    if not mem:
+        return ""
+    linhas = []
+    for m in mem[-n:]:
+        quem = "Cliente" if m.get("role") == "user" else "Atendimento"
+        txt = (m.get("content") or "").strip().replace("\n", " ")
+        if len(txt) > 200:
+            txt = txt[:200] + "…"
+        linhas.append(f"{quem}: {txt}")
+    return "\n".join(linhas)
+
+
 def intelligent_fallback(messages: List[Dict]) -> str:
     """Fallback quando o LLM falha — resposta neutra e segura."""
     return ("Oi! Aqui é da RaspadinhaShow 😊 Como posso te ajudar com a "
@@ -288,14 +303,33 @@ async def enviar_telegram(texto: str) -> None:
 async def escalar(phone: str, name: str, motivo: str, conteudo: str) -> None:
     """Avisa o Fábio no Telegram que um cliente precisa dele."""
     quem = html.escape(name or phone)
+    hist = historico_recente(phone)
     await enviar_telegram(
         f"🆘 <b>Atenção, Fábio</b>\n"
         f"👤 {quem}\n"
         f"💬 {html.escape(conteudo)}\n"
-        f"⚠️ {html.escape(motivo)}\n\n"
-        f"↩️ <i>Responda A ESTA mensagem pra falar direto com o cliente.</i>\n"
+        f"⚠️ {html.escape(motivo)}\n"
+        + (f"\n🗒️ <b>Contexto recente:</b>\n{html.escape(hist)}\n" if hist else "")
+        + f"\n↩️ <i>Responda A ESTA mensagem pra falar direto com o cliente.</i>\n"
         f"#id:{phone}"
     )
+
+
+async def enviar_telegram_foto(photo_bytes: bytes, legenda: str) -> None:
+    """Encaminha a foto do cliente pro Telegram do Fábio."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not photo_bytes:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": legenda, "parse_mode": "HTML"},
+                files={"photo": ("foto.jpg", photo_bytes, "image/jpeg")},
+            )
+        if r.status_code != 200:
+            print(f"[Telegram Foto] erro {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[Telegram Foto] exceção: {e}")
 
 
 # ----------------------------------------------------------------
@@ -404,11 +438,35 @@ async def meta_webhook(request: Request):
                         if transcricao:
                             results.append(await process_message_meta(phone, transcricao, name))
                         else:
+                            add_memory(phone, "user", "[enviou um áudio]")
                             await send_meta_message(phone, "Opa, recebi seu áudio! Deixa eu ouvir aqui e já te respondo, tá? 😊")
                             await escalar(phone, name, "chegou um ÁUDIO que não consegui ouvir", "(áudio do cliente)")
                             results.append({"status": "escalated", "reason": "audio"})
 
-                    elif mtype in ("image", "document", "video"):
+                    elif mtype == "image":
+                        await send_meta_message(phone, "Opa, recebi sua foto! Deixa eu dar uma olhada e já te falo, tá? 😊")
+                        media_id = (msg.get("image") or {}).get("id", "")
+                        legenda_cliente = (msg.get("image") or {}).get("caption", "")
+                        add_memory(phone, "user", "[enviou uma foto]" + (f" com legenda: {legenda_cliente}" if legenda_cliente else ""))
+                        img_bytes = await baixar_midia_meta(media_id)
+                        quem = html.escape(name or phone)
+                        hist = historico_recente(phone, 4)
+                        legenda = (
+                            f"🖼️ <b>Foto do cliente</b>\n"
+                            f"👤 {quem}\n"
+                            + (f"💬 {html.escape(legenda_cliente)}\n" if legenda_cliente else "")
+                            + (f"\n🗒️ <b>Contexto recente:</b>\n{html.escape(hist)}\n" if hist else "")
+                            + f"\n↩️ <i>Responda A ESTA foto pra falar com o cliente.</i>\n"
+                            f"#id:{phone}"
+                        )
+                        if img_bytes:
+                            await enviar_telegram_foto(img_bytes, legenda)
+                        else:
+                            await escalar(phone, name, "chegou uma FOTO que não consegui baixar", "(foto do cliente)")
+                        results.append({"status": "escalated", "reason": "image"})
+
+                    elif mtype in ("document", "video"):
+                        add_memory(phone, "user", f"[enviou {mtype}]")
                         await send_meta_message(phone, "Opa, recebi aqui! Deixa eu dar uma olhada e já te falo, tá? 😊")
                         await escalar(phone, name, f"chegou {mtype.upper()} (precisa da sua olhada)", f"({mtype} do cliente)")
                         results.append({"status": "escalated", "reason": mtype})
@@ -444,7 +502,8 @@ async def telegram_webhook(request: Request):
 
         # descobre o telefone do cliente
         phone = ""
-        reply_text = (msg.get("reply_to_message") or {}).get("text") or ""
+        reply = msg.get("reply_to_message") or {}
+        reply_text = reply.get("text") or reply.get("caption") or ""
         m = re.search(r"#id:(\d{8,15})", reply_text)
         if m:
             phone = m.group(1)
