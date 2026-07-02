@@ -55,6 +55,9 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 WHATSAPP_ACCESS_TOKEN    = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_VERIFY_TOKEN    = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_GRAPH_VERSION   = os.getenv("WHATSAPP_GRAPH_VERSION", "v22.0")
+WHATSAPP_REPOSICAO_TEMPLATE      = os.getenv("WHATSAPP_REPOSICAO_TEMPLATE", "disparo_reposicao")
+WHATSAPP_REPOSICAO_TEMPLATE_LANG = os.getenv("WHATSAPP_REPOSICAO_TEMPLATE_LANG", "pt_BR")
+RASPA_ADMIN_SECRET               = os.getenv("RASPA_ADMIN_SECRET", "")
 
 # Groq (transcrição de áudio via Whisper)
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
@@ -350,6 +353,38 @@ async def send_meta_message(phone: str, message: str) -> dict:
         return {"status_code": r.status_code, "text": r.text}
 
 
+async def send_meta_template(phone: str, nome: str = "") -> dict:
+    """Envia o template aprovado de reposicao fora da janela de 24h."""
+    url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    display_name = (nome or "tudo bem?").strip()
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": WHATSAPP_REPOSICAO_TEMPLATE,
+            "language": {"code": WHATSAPP_REPOSICAO_TEMPLATE_LANG},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": display_name}],
+                }
+            ],
+        },
+    }
+    print(f"[Meta Template] -> {phone}: {WHATSAPP_REPOSICAO_TEMPLATE} ({display_name})")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(url, headers=headers, json=payload)
+    print(f"[Meta Template] Status: {r.status_code} | {r.text[:300]}")
+    try:
+        data = r.json()
+    except Exception:
+        data = {"status_code": r.status_code, "text": r.text}
+    registrar_status(phone, f"template_http_{r.status_code}", data if isinstance(data, dict) else {})
+    return data
+
+
 async def process_message_meta(phone: str, message_text: str, name: str = "") -> dict:
     """Memória + LLM + persona, responde pela Meta e grava o lead em /data."""
     if not phone or not message_text:
@@ -500,6 +535,19 @@ async def telegram_webhook(request: Request):
         if not texto:
             return JSONResponse({"ok": True})
 
+        template_cmd = re.match(r"^/template\s+(\d{8,15})(?:\s+(.+))?$", texto, re.S)
+        if template_cmd:
+            phone = template_cmd.group(1)
+            nome = (template_cmd.group(2) or "").strip()
+            result = await send_meta_template(phone, nome)
+            await enviar_telegram(
+                f"🧪 <b>Template disparado</b>\n"
+                f"📱 {html.escape(phone)}\n"
+                f"📄 {html.escape(WHATSAPP_REPOSICAO_TEMPLATE)}\n"
+                f"🔎 <code>{html.escape(json.dumps(result, ensure_ascii=False)[:500])}</code>"
+            )
+            return JSONResponse({"ok": True})
+
         # descobre o telefone do cliente
         phone = ""
         reply = msg.get("reply_to_message") or {}
@@ -543,6 +591,29 @@ async def meta_webhook_health(request: Request):
     })
 
 
+async def disparo_template_test(request: Request):
+    """Disparo controlado de template aprovado para teste/manual."""
+    if not RASPA_ADMIN_SECRET:
+        return JSONResponse({"ok": False, "error": "RASPA_ADMIN_SECRET nao configurado"}, status_code=403)
+    if request.headers.get("x-raspa-admin-secret") != RASPA_ADMIN_SECRET:
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    phone = re.sub(r"\D+", "", str(data.get("phone", "")))
+    nome = str(data.get("nome", "")).strip()
+    if not phone:
+        return JSONResponse({"ok": False, "error": "phone obrigatorio"}, status_code=400)
+    result = await send_meta_template(phone, nome)
+    await enviar_telegram(
+        f"🧪 <b>Teste de template enviado</b>\n"
+        f"📱 {html.escape(phone)}\n"
+        f"📄 {html.escape(WHATSAPP_REPOSICAO_TEMPLATE)}"
+    )
+    return JSONResponse({"ok": True, "phone": phone, "template": WHATSAPP_REPOSICAO_TEMPLATE, "result": result})
+
+
 async def _is_authenticated(request: Request) -> bool:
     import httpx
     cookie = request.headers.get("cookie", "")
@@ -575,6 +646,8 @@ routes = [
     Route("/webhook/meta/health", meta_webhook_health, methods=["GET"]),
     # Telegram (Fábio responde por lá)
     Route("/webhook/telegram", telegram_webhook, methods=["POST"]),
+    # Disparo manual/teste de template (protegido por RASPA_ADMIN_SECRET)
+    Route("/admin/raspadinha/template-test", disparo_template_test, methods=["POST"]),
     # Catch-all proxy para o resto (HTTP + WebSocket)
     WebSocketRoute("/{path:path}", hermes_proxy.ws_proxy),
     Route("/{path:path}", hermes_proxy.http_proxy, methods=hermes_proxy.PROXY_METHODS),
